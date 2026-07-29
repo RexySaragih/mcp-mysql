@@ -11,6 +11,7 @@ import {
 import {
   assertExplainableSelect,
   assertReadOnlySelect,
+  formatConfirmationPrompt,
 } from '../utils/sql-safety.js';
 
 const READ_ONLY_ANNOTATIONS = {
@@ -23,7 +24,7 @@ const READ_ONLY_ANNOTATIONS = {
 export const readQueryTool: Tool = {
   name: 'read_query',
   description:
-    'Execute a single read-only SELECT (or WITH … SELECT). Mutating SQL is rejected. Results are row-capped.',
+    'Execute a single read-only SELECT (or WITH … SELECT). Mutating SQL is rejected. Queries with FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE / INTO @var require confirmed=true after a preview. Results are LIMIT-capped.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -34,6 +35,11 @@ export const readQueryTool: Tool = {
       max_rows: {
         type: 'number',
         description: `Max rows to return (default env MYSQL_MAX_ROWS / ${ClientConstants.DEFAULT_MAX_ROWS}, hard max ${ClientConstants.HARD_MAX_ROWS})`,
+      },
+      confirmed: {
+        type: 'boolean',
+        description:
+          'Required true to run SELECT variants that take locks or set session variables. If omitted/false, returns a confirmation preview explaining impact.',
       },
     },
     required: ['sql'],
@@ -67,7 +73,13 @@ export const explainQueryTool: Tool = {
 
 const readQuerySchema = z.object({
   sql: z.string().min(1),
-  max_rows: z.number().int().positive().max(ClientConstants.HARD_MAX_ROWS).optional(),
+  max_rows: z
+    .number()
+    .int()
+    .positive()
+    .max(ClientConstants.HARD_MAX_ROWS)
+    .optional(),
+  confirmed: z.boolean().optional(),
 });
 
 const explainQuerySchema = z.object({
@@ -85,13 +97,23 @@ export async function handleReadQuery(
     if (!safety.ok) {
       return toolErr(safety.reason ?? 'Rejected SQL');
     }
+
+    if (safety.needsConfirmation && !parsed.confirmed) {
+      return toolOk(formatConfirmationPrompt(safety, safety.normalized));
+    }
+
     const result = await client.readQuery(safety.normalized, parsed.max_rows);
+    const confirmationNote =
+      safety.needsConfirmation && parsed.confirmed
+        ? '\n\n_Executed after confirmation (lock / session-variable side effects)._\n'
+        : '';
     return toolOk(
-      formatRowsAsMarkdownTable(result.rows, result.fields, {
-        durationMs: result.durationMs,
-        truncated: result.truncated,
-        title: 'Query results',
-      }),
+      confirmationNote +
+        formatRowsAsMarkdownTable(result.rows, result.fields, {
+          durationMs: result.durationMs,
+          truncated: result.truncated,
+          title: 'Query results',
+        }),
     );
   } catch (error: unknown) {
     return toolErr(sanitizeErrorMessage(error));

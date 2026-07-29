@@ -14,13 +14,21 @@ import {
   describeTableTool,
   handleDescribeTable,
   handleListDatabases,
+  handleListEvents,
   handleListForeignKeys,
   handleListIndexes,
+  handleListRoutines,
   handleListTables,
+  handleListTriggers,
+  handleShowCreateTable,
   listDatabasesTool,
+  listEventsTool,
   listForeignKeysTool,
   listIndexesTool,
+  listRoutinesTool,
   listTablesTool,
+  listTriggersTool,
+  showCreateTableTool,
 } from './tools/schema.js';
 import {
   explainQueryTool,
@@ -30,7 +38,7 @@ import {
 } from './tools/query.js';
 
 const SERVER_NAME = 'mysql-mcp';
-const SERVER_VERSION = '1.0.0';
+const SERVER_VERSION = '1.1.0';
 
 const server = new Server(
   { name: SERVER_NAME, version: SERVER_VERSION },
@@ -54,8 +62,12 @@ async function start(): Promise<void> {
     listDatabasesTool,
     listTablesTool,
     describeTableTool,
+    showCreateTableTool,
     listIndexesTool,
     listForeignKeysTool,
+    listRoutinesTool,
+    listTriggersTool,
+    listEventsTool,
     readQueryTool,
     explainQueryTool,
   ];
@@ -67,8 +79,12 @@ async function start(): Promise<void> {
     list_databases: (args) => handleListDatabases(client, args),
     list_tables: (args) => handleListTables(client, args),
     describe_table: (args) => handleDescribeTable(client, args),
+    show_create_table: (args) => handleShowCreateTable(client, args),
     list_indexes: (args) => handleListIndexes(client, args),
     list_foreign_keys: (args) => handleListForeignKeys(client, args),
+    list_routines: (args) => handleListRoutines(client, args),
+    list_triggers: (args) => handleListTriggers(client, args),
+    list_events: (args) => handleListEvents(client, args),
     read_query: (args) => handleReadQuery(client, args),
     explain_query: (args) => handleExplainQuery(client, args),
   };

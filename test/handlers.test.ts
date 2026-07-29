@@ -95,6 +95,33 @@ describe('query handlers', () => {
     assert.equal(called, false);
   });
 
+  it('should preview confirmation for FOR UPDATE without confirmed', async () => {
+    let called = false;
+    const client = mockClient({
+      readQuery: async () => {
+        called = true;
+        return { rows: [], fields: [], durationMs: 0, truncated: false };
+      },
+    });
+    const result = await handleReadQuery(client, {
+      sql: 'SELECT id FROM users FOR UPDATE',
+    });
+    assert.equal(result.isError, undefined);
+    assert.equal(called, false);
+    assert.match(result.content[0].text, /Confirmation required/);
+    assert.match(result.content[0].text, /confirmed: true/);
+  });
+
+  it('should run FOR UPDATE when confirmed', async () => {
+    const result = await handleReadQuery(mockClient(), {
+      sql: 'SELECT id FROM users FOR UPDATE',
+      confirmed: true,
+    });
+    assert.equal(result.isError, undefined);
+    assert.match(result.content[0].text, /Query results/);
+    assert.match(result.content[0].text, /after confirmation/i);
+  });
+
   it('should run safe SELECT', async () => {
     const result = await handleReadQuery(mockClient(), {
       sql: 'SELECT id, email FROM users',

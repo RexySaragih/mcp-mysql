@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
 import mysql from 'mysql2/promise';
 import type { Pool, RowDataPacket } from 'mysql2/promise';
+import type { SslOptions } from 'mysql2';
 import {
   ClientConstants,
   optionalEnv,
@@ -7,13 +9,17 @@ import {
   requireEnv,
   sanitizeErrorMessage,
 } from './base-client.js';
+import { applyRowLimit } from '../utils/row-limit.js';
 import type {
   ColumnInfo,
+  EventInfo,
   ForeignKeyInfo,
   IndexInfo,
   MysqlRow,
   QueryResult,
+  RoutineInfo,
   TableSummary,
+  TriggerInfo,
 } from '../types/index.js';
 
 export interface MysqlClientConfig {
@@ -23,21 +29,72 @@ export interface MysqlClientConfig {
   user?: string;
   password?: string;
   database?: string;
-  ssl?: boolean;
+  ssl?: SslOptions;
   timeoutMs?: number;
   maxRows?: number;
 }
 
+export function databaseFromMysqlUrl(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    const name = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
+    return name.length > 0 ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildSslOptions(): SslOptions | undefined {
+  const enabled = (optionalEnv('MYSQL_SSL') ?? '').toLowerCase() === 'true';
+  if (!enabled) return undefined;
+
+  const caPath = optionalEnv('MYSQL_SSL_CA');
+  const certPath = optionalEnv('MYSQL_SSL_CERT');
+  const keyPath = optionalEnv('MYSQL_SSL_KEY');
+  const rejectUnauthorized =
+    (optionalEnv('MYSQL_SSL_REJECT_UNAUTHORIZED') ?? 'true').toLowerCase() !==
+    'false';
+
+  const ssl: SslOptions = { rejectUnauthorized };
+  if (caPath) ssl.ca = readFileSync(caPath);
+  if (certPath) ssl.cert = readFileSync(certPath);
+  if (keyPath) ssl.key = readFileSync(keyPath);
+  return ssl;
+}
+
+function parseUrlConfig(url: string): {
+  host?: string;
+  port?: number;
+  user?: string;
+  password?: string;
+  database?: string;
+} {
+  const parsed = new URL(url);
+  return {
+    host: parsed.hostname || undefined,
+    port: parsed.port ? Number(parsed.port) : undefined,
+    user: parsed.username ? decodeURIComponent(parsed.username) : undefined,
+    password: parsed.password
+      ? decodeURIComponent(parsed.password)
+      : undefined,
+    database: databaseFromMysqlUrl(url),
+  };
+}
+
 function configFromEnv(): MysqlClientConfig {
   const url = optionalEnv('MYSQL_URL');
+  const fromUrl = url ? parseUrlConfig(url) : undefined;
   return {
     url,
-    host: optionalEnv('MYSQL_HOST') ?? '127.0.0.1',
-    port: parsePositiveInt(optionalEnv('MYSQL_PORT'), 3306),
-    user: url ? undefined : requireEnv('MYSQL_USER'),
-    password: optionalEnv('MYSQL_PASSWORD') ?? '',
-    database: optionalEnv('MYSQL_DATABASE'),
-    ssl: (optionalEnv('MYSQL_SSL') ?? '').toLowerCase() === 'true',
+    host: optionalEnv('MYSQL_HOST') ?? fromUrl?.host ?? '127.0.0.1',
+    port: parsePositiveInt(
+      optionalEnv('MYSQL_PORT'),
+      fromUrl?.port ?? 3306,
+    ),
+    user: optionalEnv('MYSQL_USER') ?? fromUrl?.user,
+    password: optionalEnv('MYSQL_PASSWORD') ?? fromUrl?.password ?? '',
+    database: optionalEnv('MYSQL_DATABASE') ?? fromUrl?.database,
+    ssl: buildSslOptions(),
     timeoutMs: parsePositiveInt(
       optionalEnv('MYSQL_QUERY_TIMEOUT_MS'),
       ClientConstants.DEFAULT_TIMEOUT_MS,
@@ -63,25 +120,25 @@ export class MysqlClient {
     );
     this.defaultDatabase = config.database;
 
+    const user = config.user;
+    if (!user && !config.url) {
+      throw new Error('MYSQL_USER is required when MYSQL_URL is not set');
+    }
+
     try {
-      if (config.url) {
-        this.pool = mysql.createPool(config.url);
-      } else {
-        if (!config.user) {
-          throw new Error('MYSQL_USER is required when MYSQL_URL is not set');
-        }
-        this.pool = mysql.createPool({
-          host: config.host ?? '127.0.0.1',
-          port: config.port ?? 3306,
-          user: config.user,
-          password: config.password ?? '',
-          database: config.database,
-          waitForConnections: true,
-          connectionLimit: 4,
-          namedPlaceholders: true,
-          ssl: config.ssl ? {} : undefined,
-        });
-      }
+      // Prefer discrete fields so SSL + default database always apply,
+      // including when MYSQL_URL was the source of host/user/db.
+      this.pool = mysql.createPool({
+        host: config.host ?? '127.0.0.1',
+        port: config.port ?? 3306,
+        user: user ?? requireEnv('MYSQL_USER'),
+        password: config.password ?? '',
+        database: config.database,
+        waitForConnections: true,
+        connectionLimit: 4,
+        namedPlaceholders: true,
+        ssl: config.ssl,
+      });
     } catch (error: unknown) {
       throw new Error(`MySQL pool init failed: ${sanitizeErrorMessage(error)}`);
     }
@@ -167,6 +224,27 @@ export class MysqlClient {
     }));
   }
 
+  async showCreateTable(table: string, database?: string): Promise<string> {
+    const db = this.resolveDatabase(database);
+    const qualified = `\`${db.replace(/`/g, '``')}\`.\`${table.replace(/`/g, '``')}\``;
+    const rows = await this.queryRows<RowDataPacket>(
+      `SHOW CREATE TABLE ${qualified}`,
+      [],
+      1,
+    );
+    if (rows.length === 0) {
+      throw new Error(`Table not found: ${db}.${table}`);
+    }
+    const ddl =
+      rows[0]['Create Table'] ??
+      rows[0]['Create View'] ??
+      rows[0]['CREATE TABLE'];
+    if (ddl == null) {
+      throw new Error(`SHOW CREATE TABLE returned no DDL for ${db}.${table}`);
+    }
+    return String(ddl);
+  }
+
   async listIndexes(
     table: string,
     database?: string,
@@ -236,12 +314,114 @@ export class MysqlClient {
     }));
   }
 
+  async listRoutines(database?: string): Promise<RoutineInfo[]> {
+    const db = this.resolveDatabase(database);
+    const rows = await this.queryRows<RowDataPacket>(
+      `SELECT ROUTINE_NAME AS name,
+              ROUTINE_TYPE AS routine_type,
+              DTD_IDENTIFIER AS return_type,
+              ROUTINE_DEFINITION AS definition,
+              CREATED AS created_at,
+              LAST_ALTERED AS updated_at
+       FROM information_schema.ROUTINES
+       WHERE ROUTINE_SCHEMA = ?
+       ORDER BY ROUTINE_TYPE, ROUTINE_NAME`,
+      [db],
+      ClientConstants.HARD_MAX_ROWS,
+    );
+    return rows.map((row) => ({
+      name: String(row.name),
+      type: String(row.routine_type),
+      returnType: row.return_type == null ? null : String(row.return_type),
+      definition:
+        row.definition == null
+          ? null
+          : String(row.definition).slice(0, ClientConstants.CELL_TRUNCATE),
+      createdAt: row.created_at == null ? null : String(row.created_at),
+      updatedAt: row.updated_at == null ? null : String(row.updated_at),
+    }));
+  }
+
+  async listTriggers(
+    database?: string,
+    table?: string,
+  ): Promise<TriggerInfo[]> {
+    const db = this.resolveDatabase(database);
+    const params: unknown[] = [db];
+    let sql = `
+      SELECT TRIGGER_NAME AS name,
+             EVENT_MANIPULATION AS event,
+             EVENT_OBJECT_TABLE AS table_name,
+             ACTION_TIMING AS timing,
+             ACTION_STATEMENT AS statement
+      FROM information_schema.TRIGGERS
+      WHERE TRIGGER_SCHEMA = ?`;
+    if (table) {
+      sql += ' AND EVENT_OBJECT_TABLE = ?';
+      params.push(table);
+    }
+    sql += ' ORDER BY EVENT_OBJECT_TABLE, TRIGGER_NAME';
+    const rows = await this.queryRows<RowDataPacket>(
+      sql,
+      params,
+      ClientConstants.HARD_MAX_ROWS,
+    );
+    return rows.map((row) => ({
+      name: String(row.name),
+      event: String(row.event),
+      table: String(row.table_name),
+      timing: String(row.timing),
+      statement: String(row.statement ?? '').slice(
+        0,
+        ClientConstants.CELL_TRUNCATE,
+      ),
+    }));
+  }
+
+  async listEvents(database?: string): Promise<EventInfo[]> {
+    const db = this.resolveDatabase(database);
+    const rows = await this.queryRows<RowDataPacket>(
+      `SELECT EVENT_NAME AS name,
+              STATUS AS status,
+              EVENT_TYPE AS event_type,
+              EXECUTE_AT AS execute_at,
+              INTERVAL_VALUE AS interval_value,
+              INTERVAL_FIELD AS interval_field,
+              EVENT_DEFINITION AS definition
+       FROM information_schema.EVENTS
+       WHERE EVENT_SCHEMA = ?
+       ORDER BY EVENT_NAME`,
+      [db],
+      ClientConstants.HARD_MAX_ROWS,
+    );
+    return rows.map((row) => ({
+      name: String(row.name),
+      status: String(row.status),
+      eventType: String(row.event_type),
+      executeAt: row.execute_at == null ? null : String(row.execute_at),
+      intervalValue:
+        row.interval_value == null ? null : String(row.interval_value),
+      intervalField:
+        row.interval_field == null ? null : String(row.interval_field),
+      definition:
+        row.definition == null
+          ? null
+          : String(row.definition).slice(0, ClientConstants.CELL_TRUNCATE),
+    }));
+  }
+
   async readQuery(sql: string, maxRows?: number): Promise<QueryResult> {
     const limit = Math.min(
       maxRows ?? this.maxRows,
       ClientConstants.HARD_MAX_ROWS,
     );
-    return this.runSelect(sql, limit);
+    const cappedSql = applyRowLimit(sql, limit);
+    const result = await this.runSelect(cappedSql, limit);
+    // If we injected/clamped LIMIT, treat hitting the cap as truncated.
+    if (result.rows.length >= limit) {
+      return { ...result, truncated: true };
+    }
+    return result;
   }
 
   async explainQuery(

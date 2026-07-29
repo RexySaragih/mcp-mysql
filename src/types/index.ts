@@ -47,3 +47,30 @@ export interface ForeignKeyInfo {
   updateRule: string;
   deleteRule: string;
 }
+
+export interface RoutineInfo {
+  name: string;
+  type: string;
+  returnType: string | null;
+  definition: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface TriggerInfo {
+  name: string;
+  event: string;
+  table: string;
+  timing: string;
+  statement: string;
+}
+
+export interface EventInfo {
+  name: string;
+  status: string;
+  eventType: string;
+  executeAt: string | null;
+  intervalValue: string | null;
+  intervalField: string | null;
+  definition: string | null;
+}
