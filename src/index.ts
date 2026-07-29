@@ -8,6 +8,7 @@ import {
   ErrorCode,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
+import { warnIfRepoDotEnvPresent } from './clients/base-client.js';
 import { MysqlClient } from './clients/mysql-client.js';
 import type { ToolResponse } from './types/index.js';
 import {
@@ -36,9 +37,17 @@ import {
   handleReadQuery,
   readQueryTool,
 } from './tools/query.js';
+import {
+  handleSchemaQuery,
+  handleTransactionQuery,
+  handleWriteQuery,
+  schemaQueryTool,
+  transactionQueryTool,
+  writeQueryTool,
+} from './tools/write.js';
 
 const SERVER_NAME = 'mysql-mcp';
-const SERVER_VERSION = '1.1.0';
+const SERVER_VERSION = '1.2.0';
 
 const server = new Server(
   { name: SERVER_NAME, version: SERVER_VERSION },
@@ -56,6 +65,7 @@ function logTool(
 }
 
 async function start(): Promise<void> {
+  warnIfRepoDotEnvPresent();
   const client = new MysqlClient();
 
   const tools = [
@@ -69,6 +79,9 @@ async function start(): Promise<void> {
     listTriggersTool,
     listEventsTool,
     readQueryTool,
+    writeQueryTool,
+    schemaQueryTool,
+    transactionQueryTool,
     explainQueryTool,
   ];
 
@@ -86,6 +99,9 @@ async function start(): Promise<void> {
     list_triggers: (args) => handleListTriggers(client, args),
     list_events: (args) => handleListEvents(client, args),
     read_query: (args) => handleReadQuery(client, args),
+    write_query: (args) => handleWriteQuery(client, args),
+    schema_query: (args) => handleSchemaQuery(client, args),
+    transaction_query: (args) => handleTransactionQuery(client, args),
     explain_query: (args) => handleExplainQuery(client, args),
   };
 

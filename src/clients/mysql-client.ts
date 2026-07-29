@@ -122,7 +122,9 @@ export class MysqlClient {
 
     const user = config.user;
     if (!user && !config.url) {
-      throw new Error('MYSQL_USER is required when MYSQL_URL is not set');
+      throw new Error(
+        'MYSQL_USER is required when MYSQL_URL is not set — set either in mcp.json mcpServers.*.env',
+      );
     }
 
     try {
@@ -148,7 +150,7 @@ export class MysqlClient {
     const db = database ?? this.defaultDatabase;
     if (!db) {
       throw new Error(
-        'Database not specified — pass `database` or set MYSQL_DATABASE / include it in MYSQL_URL',
+        'Database not specified — pass `database` or set MYSQL_DATABASE / MYSQL_URL in mcp.json env',
       );
     }
     return db;
@@ -431,6 +433,104 @@ export class MysqlClient {
     const explained =
       format === 'json' ? `EXPLAIN FORMAT=JSON ${sql}` : `EXPLAIN ${sql}`;
     return this.runSelect(explained, ClientConstants.HARD_MAX_ROWS);
+  }
+
+  async executeMutation(sql: string): Promise<{
+    durationMs: number;
+    affectedRows: number;
+  }> {
+    const started = Date.now();
+    try {
+      const [result] = await this.withTimeout(
+        this.pool.query({ sql, timeout: this.timeoutMs }),
+      );
+      const header = result as { affectedRows?: number };
+      return {
+        durationMs: Date.now() - started,
+        affectedRows: Number(header.affectedRows ?? 0),
+      };
+    } catch (error: unknown) {
+      throw new Error(`Query failed: ${sanitizeErrorMessage(error)}`);
+    }
+  }
+
+  async executeTransaction(sql: string): Promise<{
+    success: boolean;
+    durationMs: number;
+    results: Array<{ statement: string; affectedRows?: number; durationMs: number }>;
+    error?: string;
+  }> {
+    const connection = await this.pool.getConnection();
+    const started = Date.now();
+    const results: Array<{
+      statement: string;
+      affectedRows?: number;
+      durationMs: number;
+    }> = [];
+
+    try {
+      const statements = sql
+        .split(';')
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0 && !/^\s*--/.test(part) && !/^\s*#/.test(part));
+
+      if (statements.length === 0) {
+        throw new Error('No valid SQL statements found');
+      }
+
+      await connection.beginTransaction();
+
+      for (const statement of statements) {
+        const upper = statement.toUpperCase().trim();
+        if (
+          upper === 'BEGIN' ||
+          upper.startsWith('BEGIN ') ||
+          upper === 'START TRANSACTION' ||
+          upper.startsWith('START TRANSACTION') ||
+          upper === 'COMMIT' ||
+          upper.startsWith('COMMIT ') ||
+          upper === 'ROLLBACK' ||
+          upper.startsWith('ROLLBACK ')
+        ) {
+          // Skip explicit txn control — we manage the transaction.
+          continue;
+        }
+
+        const stmtStart = Date.now();
+        const [result] = await connection.query({
+          sql: statement,
+          timeout: this.timeoutMs,
+        });
+        const header = result as { affectedRows?: number };
+        results.push({
+          statement:
+            statement.substring(0, 100) + (statement.length > 100 ? '...' : ''),
+          affectedRows: header.affectedRows,
+          durationMs: Date.now() - stmtStart,
+        });
+      }
+
+      await connection.commit();
+      return {
+        success: true,
+        durationMs: Date.now() - started,
+        results,
+      };
+    } catch (error: unknown) {
+      try {
+        await connection.rollback();
+      } catch {
+        // ignore
+      }
+      return {
+        success: false,
+        durationMs: Date.now() - started,
+        results,
+        error: sanitizeErrorMessage(error),
+      };
+    } finally {
+      connection.release();
+    }
   }
 
   async close(): Promise<void> {

@@ -1,13 +1,31 @@
 # TOOL_SPEC — mysql-mcp
 
 ## Goal
-Let agents inspect MySQL/MariaDB schema and run safe read-only SELECT queries against a configured database.
+Let agents inspect MySQL/MariaDB schema, run SELECT queries, and perform **confirmation-gated** writes/DDL/transactions via separate tools.
 
 ## Non-goals
-- INSERT / UPDATE / DELETE / DDL / multi-statement transactions
-- Arbitrary admin (GRANT, FLUSH, LOAD DATA, CALL procedures that mutate)
+- Mixing DML into `read_query`
 - MCP Resources / Prompts
-- Aurora IAM token auth / RDS Data API (use AWS Labs MCP for those)
+- Aurora IAM / RDS Data API
+
+## v1 posture
+- [x] reads
+- [x] writes included (separate `write_query` — strong confirmation)
+- [x] destructive included (separate `schema_query` / `transaction_query` — strong confirmation)
+
+## Tools (writes kept separate)
+| Name | Notes |
+|------|-------|
+| … schema inspect tools … | read-only |
+| `read_query` | SELECT only; locks need confirm |
+| `write_query` | INSERT/UPDATE/DELETE/REPLACE/TRUNCATE — **confirmed:true** |
+| `schema_query` | CREATE/ALTER/DROP/RENAME — **confirmed:true** |
+| `transaction_query` | multi-statement — per-stmt preview + **confirmed:true** |
+| `explain_query` | EXPLAIN |
+
+## Security notes
+- Strong confirmation copy explains impact and requires explicit `confirmed: true`
+- Prefer least-privilege DB user; use a write-capable role only when needed
 
 ## Research summary
 - API docs: https://dev.mysql.com/doc/refman/8.4/en/ + https://github.com/sidorares/node-mysql2
@@ -16,7 +34,8 @@ Let agents inspect MySQL/MariaDB schema and run safe read-only SELECT queries ag
 - Existing MCP: AWS Labs Aurora MySQL MCP (IAM/Data API) — this server targets generic MySQL/MariaDB over the wire
 - Language: TypeScript | Transport: stdio
 - MCP SDK: `@modelcontextprotocol/sdk@1.30.0`
-- Residual risks: prompt injection via row data; over-broad DB credentials; lock contention from confirmed FOR UPDATE queries
+- Residual risks: prompt injection via row data; confirmed writes are permanent; transaction blast radius
+- Prefer SELECT-only user for read agents; write-capable role when using write/schema/transaction tools
 
 ## Identity & credentials
 | Env var | Required | Purpose |

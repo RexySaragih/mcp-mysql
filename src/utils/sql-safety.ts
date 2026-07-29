@@ -177,18 +177,9 @@ export function assertReadOnlySelect(sql: string): SqlSafetyResult {
 
   const keyword = leadingKeyword(withoutComments);
   if (keyword !== 'SELECT' && keyword !== 'WITH') {
-    if ((MUTATING_PREFIXES as readonly string[]).includes(keyword)) {
-      return {
-        ok: false,
-        reason: `Rejected ${keyword} — this server is read-only (SELECT / WITH only)`,
-        normalized: withoutComments,
-        risks: [],
-        needsConfirmation: false,
-      };
-    }
     return {
       ok: false,
-      reason: `Unsupported statement type "${keyword || 'UNKNOWN'}" — only SELECT or WITH`,
+      reason: `Rejected ${keyword || 'UNKNOWN'} — use write_query / schema_query / transaction_query for mutating SQL (with confirmation)`,
       normalized: withoutComments,
       risks: [],
       needsConfirmation: false,
@@ -202,7 +193,7 @@ export function assertReadOnlySelect(sql: string): SqlSafetyResult {
       if (re.test(upper)) {
         return {
           ok: false,
-          reason: `CTE contains forbidden keyword ${bad}`,
+          reason: `CTE contains forbidden keyword ${bad} — use write_query / schema_query instead`,
           normalized: withoutComments,
           risks: [],
           needsConfirmation: false,
@@ -260,6 +251,233 @@ export function formatConfirmationPrompt(
     'Call `read_query` again with the **same `sql`** and set `confirmed: true`.',
     '',
     'If you did not intend locking or session variables, rewrite the query as a plain SELECT without `FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` / `INTO @var`.',
+  );
+
+  return lines.join('\n');
+}
+
+export type QueryType =
+  | 'SELECT'
+  | 'INSERT'
+  | 'UPDATE'
+  | 'DELETE'
+  | 'REPLACE'
+  | 'TRUNCATE'
+  | 'CREATE'
+  | 'ALTER'
+  | 'DROP'
+  | 'RENAME'
+  | 'SET'
+  | 'BEGIN'
+  | 'COMMIT'
+  | 'ROLLBACK'
+  | 'CALL'
+  | 'UNKNOWN';
+
+export interface QueryAnalysis {
+  type: QueryType;
+  isReadOnly: boolean;
+  warningLevel: 'NONE' | 'MEDIUM' | 'HIGH';
+  estimatedImpact: string;
+  normalized: string;
+}
+
+function classifyWriteKeyword(keyword: string): QueryType {
+  const known: QueryType[] = [
+    'SELECT',
+    'INSERT',
+    'UPDATE',
+    'DELETE',
+    'REPLACE',
+    'TRUNCATE',
+    'CREATE',
+    'ALTER',
+    'DROP',
+    'RENAME',
+    'SET',
+    'BEGIN',
+    'COMMIT',
+    'ROLLBACK',
+    'CALL',
+  ];
+  return (known as string[]).includes(keyword)
+    ? (keyword as QueryType)
+    : 'UNKNOWN';
+}
+
+function impactForWrite(type: QueryType): {
+  isReadOnly: boolean;
+  warningLevel: 'NONE' | 'MEDIUM' | 'HIGH';
+  estimatedImpact: string;
+} {
+  switch (type) {
+    case 'SELECT':
+      return {
+        isReadOnly: true,
+        warningLevel: 'NONE',
+        estimatedImpact: 'Read-only',
+      };
+    case 'INSERT':
+    case 'REPLACE':
+      return {
+        isReadOnly: false,
+        warningLevel: 'MEDIUM',
+        estimatedImpact: 'Will insert or replace rows permanently',
+      };
+    case 'UPDATE':
+      return {
+        isReadOnly: false,
+        warningLevel: 'MEDIUM',
+        estimatedImpact: 'Will modify existing rows permanently',
+      };
+    case 'DELETE':
+    case 'TRUNCATE':
+      return {
+        isReadOnly: false,
+        warningLevel: 'HIGH',
+        estimatedImpact: 'Will permanently delete rows (often irreversible)',
+      };
+    case 'CREATE':
+    case 'ALTER':
+    case 'DROP':
+    case 'RENAME':
+      return {
+        isReadOnly: false,
+        warningLevel: 'HIGH',
+        estimatedImpact: 'Will change database structure (DDL)',
+      };
+    case 'SET':
+    case 'CALL':
+      return {
+        isReadOnly: false,
+        warningLevel: 'HIGH',
+        estimatedImpact: 'Will change session state or run a procedure',
+      };
+    default:
+      return {
+        isReadOnly: false,
+        warningLevel: 'HIGH',
+        estimatedImpact: 'Unknown / potentially destructive statement',
+      };
+  }
+}
+
+/** Classify a single statement for write/schema/transaction tools. */
+export function analyzeQuery(sql: string): QueryAnalysis {
+  const normalized = stripSqlComments(sql).trim();
+  if (!normalized) {
+    return {
+      type: 'UNKNOWN',
+      isReadOnly: false,
+      warningLevel: 'HIGH',
+      estimatedImpact: 'Empty SQL',
+      normalized: '',
+    };
+  }
+
+  const keyword = leadingKeyword(normalized);
+  let type = classifyWriteKeyword(keyword);
+
+  if (keyword === 'WITH') {
+    const upper = normalized.toUpperCase();
+    const mutating = (
+      ['INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'CREATE', 'ALTER', 'DROP'] as const
+    ).find((verb) => new RegExp(`\\b${verb}\\b`).test(upper));
+    if (mutating) {
+      type = mutating;
+    } else if (/\bSELECT\b/.test(upper)) {
+      type = 'SELECT';
+    } else {
+      type = 'UNKNOWN';
+    }
+  }
+
+  const meta = impactForWrite(type);
+  return {
+    type,
+    isReadOnly: meta.isReadOnly,
+    warningLevel: meta.warningLevel,
+    estimatedImpact: meta.estimatedImpact,
+    normalized,
+  };
+}
+
+export function splitSqlStatements(sql: string): string[] {
+  return stripSqlComments(sql)
+    .split(';')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+}
+
+export function formatWriteConfirmation(
+  toolName: string,
+  analysis: QueryAnalysis,
+  sql: string,
+): string {
+  return [
+    `## ⛔ Confirmation required — nothing executed yet (${analysis.warningLevel})`,
+    '',
+    `**Tool:** \`${toolName}\``,
+    `**Statement type:** ${analysis.type}`,
+    `**Impact:** ${analysis.estimatedImpact}`,
+    '',
+    '### What will happen if you approve',
+    `- The MCP MySQL user will run this SQL against the live database.`,
+    `- ${analysis.estimatedImpact}.`,
+    '- There is no automatic undo. Backups/point-in-time recovery (if any) are outside this tool.',
+    '',
+    '### Query',
+    '```sql',
+    sql,
+    '```',
+    '',
+    '### How to approve (strong gate)',
+    `1. Re-read the impact above.`,
+    `2. Call \`${toolName}\` again with the **exact same \`sql\`**.`,
+    `3. Set **\`confirmed: true\`** (boolean true — required).`,
+    '',
+    'If you are unsure, do **not** confirm. Ask a human or rewrite the SQL.',
+  ].join('\n');
+}
+
+export function formatTransactionConfirmation(sql: string): string {
+  const statements = splitSqlStatements(sql);
+  const lines: string[] = [
+    '## ⛔ Confirmation required — TRANSACTION (nothing executed yet)',
+    '',
+    '### What will happen if you approve',
+    '- All statements run in **one MySQL transaction** (START TRANSACTION / COMMIT).',
+    '- On error the transaction is **ROLLBACK**ed.',
+    '- Mixed DML/DDL may implicitly commit in MySQL — review each statement carefully.',
+    '',
+    `**Statement count:** ${statements.length}`,
+    '',
+    '### Per-statement risk',
+  ];
+
+  statements.forEach((statement, index) => {
+    const analysis = analyzeQuery(statement);
+    lines.push(
+      `${index + 1}. \`${analysis.type}\` (${analysis.warningLevel}) — ${analysis.estimatedImpact}`,
+    );
+    lines.push('```sql');
+    lines.push(
+      statement.length > 160 ? `${statement.slice(0, 160)}…` : statement,
+    );
+    lines.push('```');
+  });
+
+  lines.push(
+    '',
+    '### Full SQL',
+    '```sql',
+    sql,
+    '```',
+    '',
+    '### How to approve (strong gate)',
+    'Call `transaction_query` again with the **same `sql`** and **`confirmed: true`**.',
+    '',
+    'Do not confirm unless every statement above is intentional.',
   );
 
   return lines.join('\n');

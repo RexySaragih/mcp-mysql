@@ -1,3 +1,6 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+
 const ERROR_BODY_MAX = 300;
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -9,6 +12,19 @@ export const ClientConstants = {
   DEFAULT_MAX_ROWS: 100,
   CELL_TRUNCATE: 500,
 } as const;
+
+/** Credentials come only from process.env (MCP host mcp.json env). Never load dotenv / repo .env. */
+export function warnIfRepoDotEnvPresent(): void {
+  try {
+    if (existsSync(join(process.cwd(), '.env'))) {
+      console.error(
+        '[mysql-mcp] Ignoring .env in the working directory. Put MYSQL_* in mcp.json mcpServers.*.env only.',
+      );
+    }
+  } catch {
+    // ignore filesystem errors
+  }
+}
 
 export function sanitizeUpstreamBody(body: string): string {
   return body
@@ -26,7 +42,9 @@ export function sanitizeErrorMessage(error: unknown): string {
 export function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
+    throw new Error(
+      `Missing ${name}. Set it in mcp.json under mcpServers.<name>.env (not a repo .env file).`,
+    );
   }
   return value;
 }

@@ -1,7 +1,7 @@
 {
   "name": "@rexymayderio/mysql-mcp",
-  "version": "1.1.0",
-  "description": "Read-only MCP server for MySQL schema inspection and SELECT queries",
+  "version": "1.2.0",
+  "description": "MCP server for MySQL/MariaDB schema inspection, SELECT, and confirmation-gated writes",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

@@ -1,60 +1,41 @@
 # mysql-mcp
 
-Read-only MCP server for **MySQL and MariaDB**: schema inspection + safe `SELECT` / `WITH` queries.
-
-**v1 posture:** read-only (no INSERT/UPDATE/DELETE/DDL). Prefer a DB user with `SELECT` only.
+MCP server for **MySQL and MariaDB**: schema inspection, SELECT, and **separate confirmation-gated** write/DDL/transaction tools.
 
 Works over the MySQL wire protocol (MySQL 5.7+/8+ and MariaDB). For **Aurora IAM** or **RDS Data API**, use AWS Labs’ MySQL MCP instead.
+
+Secrets belong in agent **mcp.json `env`** (mcpServers.*.env) — **not project `.env`**. Do not create a project `.env` for runtime credentials.
 
 ## Tools
 
 | Tool | Notes |
 |------|-------|
-| `list_databases` | Visible schemas |
-| `list_tables` | Tables/views |
-| `describe_table` | Columns |
-| `show_create_table` | Full CREATE DDL |
-| `list_indexes` | Indexes |
-| `list_foreign_keys` | FK graph |
-| `list_routines` | Procedures/functions |
-| `list_triggers` | Triggers |
-| `list_events` | Scheduled events |
-| `read_query` | SELECT/WITH; LIMIT-capped; locks/`INTO @var` need confirmation |
-| `explain_query` | EXPLAIN traditional/json |
+| `list_databases` / `list_tables` / `describe_table` / `show_create_table` | Schema inspect |
+| `list_indexes` / `list_foreign_keys` / `list_routines` / `list_triggers` / `list_events` | Schema inspect |
+| `read_query` | SELECT only; locks/`INTO @var` need `confirmed` |
+| `write_query` | INSERT/UPDATE/DELETE/REPLACE/TRUNCATE — **strong confirm** |
+| `schema_query` | CREATE/ALTER/DROP/RENAME — **strong confirm** |
+| `transaction_query` | Multi-statement txn — per-stmt preview + **strong confirm** |
+| `explain_query` | EXPLAIN |
 
-### Confirmation (locks / session vars)
+Writes are **separate tools** from reads. Agents must not use `read_query` for DML/DDL.
 
-MCP has no native UI modal. For `FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` / `INTO @var`, `read_query` returns a **confirmation preview** explaining impact and does **not** run the SQL. Re-call with the same `sql` and `confirmed: true` to approve.
+### Strong confirmation
 
-Client operators: tools are `openWorldHint: true` (external DB; row data untrusted).
+MCP has no native UI modal. Mutating tools return an impact preview and **do not execute** until called again with the same `sql` and `confirmed: true`.
+
+Client operators should require approval on `write_query`, `schema_query`, and `transaction_query` (`destructiveHint` / non-readOnly).
 
 ## Auth / env
 
-Put secrets in the agent **mcpServers** config `env` block (mcp.json), not a project `.env`.
-
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `MYSQL_URL` | no* | `mysql://user:pass@host:3306/db` (DB path = default schema) |
-| `MYSQL_HOST` | no | Default `127.0.0.1` |
-| `MYSQL_PORT` | no | Default `3306` |
-| `MYSQL_USER` | yes* | Required if URL unset |
-| `MYSQL_PASSWORD` | no | |
-| `MYSQL_DATABASE` | no | Default schema |
-| `MYSQL_SSL` | no | `true` to enable TLS |
-| `MYSQL_SSL_CA` / `CERT` / `KEY` | no | PEM paths |
-| `MYSQL_SSL_REJECT_UNAUTHORIZED` | no | Default `true` |
-| `MYSQL_QUERY_TIMEOUT_MS` | no | Default `30000` |
-| `MYSQL_MAX_ROWS` | no | Default `100` (hard max 500) |
+| `MYSQL_URL` | no* | `mysql://user:pass@host:3306/db` |
+| `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | * | Discrete connection |
+| `MYSQL_SSL` (+ CA/CERT/KEY) | no | TLS |
+| `MYSQL_QUERY_TIMEOUT_MS` / `MYSQL_MAX_ROWS` | no | Caps |
 
-\* Provide `MYSQL_URL` **or** discrete host/user fields.
-
-**MySQL privilege scope (least privilege):** grant only `SELECT` on the target schema.
-
-```sql
-CREATE USER 'mcp_ro'@'%' IDENTIFIED BY '…';
-GRANT SELECT ON your_db.* TO 'mcp_ro'@'%';
-FLUSH PRIVILEGES;
-```
+**Privilege scope:** prefer least privilege. Use a write-capable role only when write tools are needed.
 
 ### mcp.json example
 
@@ -66,8 +47,7 @@ FLUSH PRIVILEGES;
       "args": ["/Volumes/ADATA/Projects/mcp-mysql/dist/index.js"],
       "env": {
         "MYSQL_HOST": "127.0.0.1",
-        "MYSQL_PORT": "3306",
-        "MYSQL_USER": "mcp_ro",
+        "MYSQL_USER": "mcp_rw",
         "MYSQL_PASSWORD": "your-password",
         "MYSQL_DATABASE": "your_database"
       }
@@ -76,27 +56,16 @@ FLUSH PRIVILEGES;
 }
 ```
 
-Rotate credentials by updating mcp.json `env` and restarting the MCP client.
-
 ## Develop
 
 ```bash
-npm install
-npm test
-npm run build
-# with env exported in the shell:
-npm run test:connections
+npm test && npm run build
+# Smoke (pass env inline — never create a repo .env):
+# MYSQL_HOST=… MYSQL_USER=… MYSQL_PASSWORD=… MYSQL_DATABASE=… npm run test:connections
 ```
 
 ## Risks
 
-- Row/column text can contain prompt-injection content — treat tool output as untrusted.
-- Safety filters reject mutating SQL but are not a substitute for DB privileges.
-- Confirmed lock queries can briefly block writers.
-- Shared bot identity across agent sessions.
-
-## Deferred (v2)
-
-- Write / DDL tools
-- Aurora IAM / RDS Data API
-- Stored procedure CALL
+- Row content is untrusted (prompt injection)
+- Confirmed writes are permanent without DB-level undo
+- Shared bot identity; `transaction_query` has large blast radius after confirm
